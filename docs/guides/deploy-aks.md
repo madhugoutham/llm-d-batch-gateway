@@ -1,23 +1,23 @@
-# Batch Gateway on AKS with RHAIIS (Operator-based)
+# Batch Gateway on xKS with RHAIIS (Operator-based)
 
-This guide demonstrates how to deploy batch-gateway on AKS using the **batch-gateway operator** on top of [RHAIIS](https://github.com/opendatahub-io/odh-gitops/blob/main/charts/rhai-on-xks-chart/README.md), using [Kuadrant](https://kuadrant.io/) for authentication, authorization, and rate limiting.
+This guide demonstrates how to deploy batch-gateway on AKS or CKS (CoreWeave) using the **batch-gateway operator** on top of [RHAIIS](https://github.com/opendatahub-io/odh-gitops/blob/main/charts/rhai-on-xks-chart/README.md), using [Kuadrant](https://kuadrant.io/) for authentication, authorization, and rate limiting.
 
 > **Note**: The batch gateway does not depend on Kuadrant. This guide uses Kuadrant for gateway-level auth and rate limiting, but any policy engine that works with Gateway API can be used instead.
 
-> **Note**: This guide is for AKS clusters **without** OpenShift. If you have OpenShift, see [deploy-rhoai.md](deploy-rhoai.md).
+> **Note**: This guide is for AKS or CKS clusters **without** OpenShift. If you have OpenShift, see [deploy-rhoai.md](deploy-rhoai.md).
 
 ## 1. Architecture Overview
 
 ### 1.1 Namespace Layout
 
-| Namespace | Purpose |
-|-----------|---------|
-| `istio-system` | Istio control plane (istiod) — installed by RHAIIS |
-| `redhat-ods-applications` | KServe, inference-gateway, RHAIIS controllers, batch-gateway-operator — installed by RHAIIS + kustomize |
-| `llm` (example; any user-defined namespace) | LLMInferenceService, model servers, InferencePool, EPP, InferenceObjective CRDs |
-| `redhat-ods-operator` | RHAI operator — installed by RHAIIS |
-| `cert-manager` | cert-manager — installed by RHAIIS |
-| `kuadrant-system` | Kuadrant operator, Authorino, Limitador |
+| Namespace | Purpose | Layer |
+|-----------|---------|-------|
+| `redhat-ods-operator` | RHAI operator — installed by RHAIIS | Control plane |
+| `redhat-ods-applications` | KServe, inference-gateway, RHAIIS controllers, batch-gateway-operator — installed by RHAIIS + kustomize | Control plane |
+| `istio-system` | Istio control plane (istiod) — installed by RHAIIS | Control plane |
+| `cert-manager` | cert-manager — installed by RHAIIS | Control plane |
+| `kuadrant-system` | Kuadrant operator, Authorino, Limitador | Control plane |
+| `llm` (example; any user-defined namespace) | LLMInferenceService, model servers, InferencePool, EPP, InferenceObjective CRDs | Data plane |
 | `batch-api` | batch-gateway (apiserver + processor + gc), Redis, PostgreSQL |
 
 ### 1.2 Data Flow
@@ -81,10 +81,11 @@ For full details on flow control configuration, see the [Flow Control Setup Guid
 
 ## 2. Prerequisites
 
-- AKS cluster (Kubernetes 1.28+) with GPU nodes
-- **RHAIIS installed** (latest version) — follow the [rhai-on-xks-chart README](https://github.com/opendatahub-io/odh-gitops/blob/main/charts/rhai-on-xks-chart/README.md) to install RHAIIS on AKS
-- CLI tools: `kubectl`, `helm`, `curl`, `jq`, `skopeo`
-- Pull secret at `~/pull-secret.txt` (for quay.io/rhoai and registry images)
+- AKS or CKS cluster (Kubernetes 1.28+) with GPU nodes (or CPU nodes for simulator testing)
+- **RHAIIS installed** — follow the [rhai-on-xks-chart README](https://github.com/opendatahub-io/odh-gitops/blob/main/charts/rhai-on-xks-chart/README.md) to install RHAIIS
+- CLI tools: `kubectl`, `helm`, `curl`, `jq`
+- Pull secret at `~/pull-secret.json` (for quay.io/rhoai and registry.redhat.io images)
+- **CKS**: NVIDIA device plugin is pre-installed by CoreWeave. No additional GPU setup needed.
 
 ### Verify RHAIIS Installation
 
@@ -181,6 +182,50 @@ EOF
 kubectl wait kuadrant/kuadrant --for="condition=Ready=true" \
     -n "${KUADRANT_NS}" --timeout=300s
 ```
+
+</details>
+
+<details>
+<summary>CKS alternative: Install RHCL via rhaii-on-xks helmfile</summary>
+
+On CKS, Kuadrant is installed as RHCL (Red Hat Connectivity Link) via the rhaii-on-xks helmfile:
+
+```bash
+cd ~/redhat/rhaii-on-xks
+make deploy-rhcl
+```
+
+> **CKS gotcha**: The Kuadrant operator RBAC is missing `monitoring.coreos.com` permissions and will CrashLoopBackOff. Fix:
+
+```bash
+kubectl apply -f - <<'EOF'
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kuadrant-monitoring-fix
+rules:
+- apiGroups: ["monitoring.coreos.com"]
+  resources: ["podmonitors", "servicemonitors"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kuadrant-monitoring-fix
+subjects:
+- kind: ServiceAccount
+  name: kuadrant-operator-controller-manager
+  namespace: kuadrant-operators
+roleRef:
+  kind: ClusterRole
+  name: kuadrant-monitoring-fix
+  apiGroup: rbac.authorization.k8s.io
+EOF
+
+kubectl delete pod -l control-plane=controller-manager -n kuadrant-operators
+```
+
+> **Known issue (RHCL only)**: The Kuadrant wasm plugin in RHCL 1.4.0 fails to call Limitador correctly, so rate limiting never triggers 429. This does not affect vanilla Kuadrant Helm installs (AKS path above). A fix is expected in a future RHCL release.
 
 </details>
 
@@ -687,6 +732,7 @@ kubectl label namespace "${BATCH_NS}" llm-d.ai/gateway-route=true --overwrite
 # Install Redis (or Valkey — see alternative below)
 helm upgrade --install redis oci://registry-1.docker.io/bitnamicharts/redis \
     --namespace ${BATCH_NS} --create-namespace \
+    --version 27.0.14 \
     --set architecture=standalone \
     --set auth.enabled=false
 kubectl rollout status statefulset/redis-master -n ${BATCH_NS} --timeout=120s
@@ -704,13 +750,14 @@ kubectl rollout status statefulset/redis-master -n ${BATCH_NS} --timeout=120s
 PG_PASSWORD="<your-password>"   # set once, referenced below
 helm upgrade --install postgresql oci://registry-1.docker.io/bitnamicharts/postgresql \
     --namespace ${BATCH_NS} --create-namespace \
+    --version 18.7.12 \
     --set "auth.postgresPassword=${PG_PASSWORD}" \
     --set auth.database=batch
 kubectl rollout status statefulset/postgresql -n ${BATCH_NS} --timeout=120s
 
 # Install MinIO (S3-compatible object storage for batch files)
-MINIO_USER=<your-minio-user>
-MINIO_PASSWORD=<your-minio-password>
+MINIO_USER="<your-minio-user>"
+MINIO_PASSWORD="<your-minio-password>"
 MINIO_BUCKET=batch-gateway
 
 kubectl apply -f - <<EOF
@@ -785,6 +832,8 @@ kubectl create secret generic batch-gateway-secrets \
 ```
 
 > **Note**: Redis auth is disabled for demo purposes. For production, enable Redis authentication.
+
+> **Demo only**: MinIO uses `emptyDir` — data is lost on pod restart. For production, use a PVC with `ReadWriteMany` or a managed S3-compatible service.
 
 </details>
 
@@ -977,6 +1026,33 @@ EOF
 ```
 
 </details>
+
+> **CKS gotcha**: EPP pods may crash with "failed waiting for InferenceModelRewrite Informer to sync". This is an RBAC gap — the EPP ServiceAccount lacks `llm-d.ai` API group permissions. Fix per LLMInferenceService:
+
+```bash
+kubectl apply -n ${LLM_NS} -f - <<EOF
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: epp-llmd-fix
+rules:
+- apiGroups: ["llm-d.ai"]
+  resources: ["inferencemodelrewrites", "inferenceobjectives"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: epp-llmd-fix
+subjects:
+- kind: ServiceAccount
+  name: ${ISVC_NAME}-epp-sa
+roleRef:
+  kind: Role
+  name: epp-llmd-fix
+  apiGroup: rbac.authorization.k8s.io
+EOF
+```
 
 ## 4. Test
 
@@ -1182,7 +1258,9 @@ for i in $(seq 1 25); do
 done
 ```
 
-## 5. AKS-Specific Considerations
+## 5. Platform-Specific Considerations
+
+### AKS
 
 This section documents AKS platform differences that apply regardless of install method (operator or Helm).
 
@@ -1348,25 +1426,40 @@ Enable [Azure Monitor managed service for Prometheus](https://learn.microsoft.co
 | `azurefile-csi` / `azurefile-csi-premium` PVC provisioning fails | Subscription policy requires HTTPS-only storage accounts; CSI driver creates accounts without HTTPS | Pre-create storage account with `--https-only true` (see File Storage Option B above) |
 | `Microsoft.Storage` provider not registered | `az storage account create` returns `SubscriptionNotFound` | Run `az provider register --namespace Microsoft.Storage` and wait for `Registered` state |
 
+### CKS (CoreWeave)
+
+- **Storage**: CoreWeave provides `shared-vast` with ReadWriteMany — no Azure Files setup needed for filesystem storage mode
+- **NVIDIA device plugin**: Pre-installed by CoreWeave, no additional GPU setup
+- **PKI naming**: The RHAIIS helmfile creates certificates with `opendatahub-*` names, while the rhai-on-xks-chart expects `rhai-*` names. On shared clusters, you may need both sets of PKI resources
+- **Monitoring CRDs**: CKS clusters do not ship Prometheus Operator CRDs by default. If Helm charts fail on PodMonitor/ServiceMonitor resources:
+
+```bash
+kubectl apply --server-side -f \
+  https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/v0.80.0/example/prometheus-operator-crd/monitoring.coreos.com_podmonitors.yaml
+kubectl apply --server-side -f \
+  https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/v0.80.0/example/prometheus-operator-crd/monitoring.coreos.com_servicemonitors.yaml
+```
+
 ## 6. Differences from RHOAI Guide
 
-| Aspect | RHOAI (OCP) | AKS (this guide) |
-|--------|-------------|-------------------|
-| Platform stack | RHOAI operator (OLM) | RHAIIS Helm chart (`rhai-on-xks-chart`) |
-| CLI | `oc` | `kubectl` |
-| Gateway class | `openshift-default` | `istio` (via RHAIIS Sail Operator) |
-| External gateway | `openshift-ai-inference` in `openshift-ingress` | `inference-gateway` in `redhat-ods-applications` |
-| Internal gateway namespace | `openshift-ingress` | `redhat-ods-applications` |
-| Batch gateway operator | Managed by RHOAI DataScienceCluster | `llm-d-batch-gateway-operator` via kustomize (no OLM) |
-| Auth/Rate limiting | RHCL (OLM) | Kuadrant (Helm) |
-| TLS certificates | OpenShift serving certs | cert-manager (installed by RHAIIS) |
-| Gateway hostname | DNS-based (`llm-inference.apps.<domain>`) | IP-based (LoadBalancer external IP) |
+| Aspect | RHOAI (OCP) | AKS | CKS |
+|--------|-------------|-----|-----|
+| Platform stack | RHOAI operator (OLM) | RHAIIS Helm chart | RHAIIS Helm chart |
+| CLI | `oc` | `kubectl` | `kubectl` |
+| Gateway class | `openshift-default` | `istio` (RHAIIS Sail) | `istio` (RHAIIS Sail) |
+| External gateway | `openshift-ai-inference` in `openshift-ingress` | `inference-gateway` in `redhat-ods-applications` | `inference-gateway` in `redhat-ods-applications` |
+| Internal gateway | `openshift-ingress` | User namespace | User namespace |
+| Batch gateway operator | Managed by DSC | kustomize (no OLM) | kustomize (no OLM) |
+| Auth/Rate limiting | RHCL (OLM) | Kuadrant (Helm) | RHCL (helmfile) |
+| TLS certificates | OpenShift serving certs | cert-manager | cert-manager |
+| Gateway hostname | DNS-based (`*.apps.<domain>`) | IP-based (LoadBalancer) | IP-based (LB or port-forward) |
+| RBAC gaps | None (OLM CSV grants all) | None | Kuadrant + EPP need manual fixes |
 
 ## 7. Troubleshooting
 
 | Symptom | Cause | Resolution |
 |---------|-------|------------|
-| RHAIIS pods `ImagePullBackOff` | Pull secret missing registry credentials | Check `~/pull-secret.txt` covers all registries (see [rhai-on-xks-chart README](https://github.com/opendatahub-io/odh-gitops/blob/main/charts/rhai-on-xks-chart/README.md)) |
+| RHAIIS pods `ImagePullBackOff` | Pull secret missing registry credentials | Check `~/pull-secret.json` covers all registries (see [rhai-on-xks-chart README](https://github.com/opendatahub-io/odh-gitops/blob/main/charts/rhai-on-xks-chart/README.md)) |
 | Model pods `Init:ImagePullBackOff` in `llm` | `rhai-pull-secret` not copied into model namespace | Copy secret from `redhat-ods-applications` before applying the CR (see [§3.2](#32-deploy-model-with-llminferenceservice)); delete pods to retry |
 | `inference-gateway` not Programmed | Istio not ready | `kubectl get pods -n istio-system` and check Sail Operator |
 | `LLMInferenceService` stuck | Controller not ready or missing CRDs | `kubectl logs -n redhat-ods-applications -l app=llmisvc-controller-manager` |
@@ -1378,6 +1471,9 @@ Enable [Azure Monitor managed service for Prometheus](https://learn.microsoft.co
 | PVC mount fails | AKS block storage doesn't support RWX | Use MinIO/S3 (recommended) or Azure Files with pre-created storage account |
 | File upload returns S3 error | `s3-secret-access-key` does not match `MINIO_ROOT_PASSWORD` | Recreate the `batch-gateway-secrets` secret with matching credentials |
 | Pods `CrashLoopBackOff` with URL parse error | Special characters in `postgresql-url` | URL-encode the password in the connection string |
+| Kuadrant operator CrashLoopBackOff | Missing `monitoring.coreos.com` RBAC (CKS) | Apply ClusterRole fix (see step 3.1 CKS alternative) |
+| EPP pods CrashLoopBackOff | Missing `llm-d.ai` RBAC (CKS) | Apply Role/RoleBinding fix (see after step 3.6) |
+| CRD field manager conflict | Pre-existing CRDs on shared cluster | `kubectl apply --server-side --force-conflicts` |
 | `inference-gateway-istio` OOMKilled | Kuadrant wasm plugin exceeds default 1Gi memory | Increase memory to 2Gi in the `inference-gateway-config` ConfigMap (`data.deployment` → `containers[].resources.limits.memory`) and wait for rollout — do not patch the deployment directly, the Istio gateway controller will revert it |
 | Batch requests return 403 | User lacks RBAC on `llminferenceservices` | Create Role/RoleBinding for `get llminferenceservices/<isvc-name>` |
 | Curl returns 000 (timeout) | External IP not routable from workstation | Port-forward: `kubectl port-forward svc/inference-gateway-istio -n redhat-ods-applications 8080:80` |
